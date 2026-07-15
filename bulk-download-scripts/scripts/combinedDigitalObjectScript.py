@@ -28,6 +28,8 @@ import shutil
 import re
 import time
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import parse_qsl
 from PIL import Image, ImageSequence
@@ -35,7 +37,8 @@ from PyPDF2 import PdfMerger
 
 # --- Configuration ---
 CATALOG_API_BASE_URL = 'https://catalog.archives.gov/api/v2/records/search'
-MAX_PDF_FILE_SIZE_MB = 500 
+MAX_PDF_FILE_SIZE_MB = 500
+DEFAULT_WORKERS = 20
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -181,6 +184,30 @@ def run_pdf_logic(naid, naid_dir):
             try: shutil.rmtree(comp_dir)
             except: pass
 
+_thread_local = threading.local()
+
+def _get_thread_session():
+    """Return a per-thread requests.Session so connections are reused within each worker."""
+    if not hasattr(_thread_local, 'session'):
+        _thread_local.session = requests.Session()
+    return _thread_local.session
+
+def download_file(url, file_path):
+    """Download a single URL to file_path. Returns (url, file_path, exception_or_None)."""
+    if file_path.exists():
+        return (url, file_path, None)
+    try:
+        r = _get_thread_session().get(url, stream=True, timeout=30)
+        r.raise_for_status()
+        with open(file_path, 'wb') as f:
+            for chunk in r.iter_content(65536):  # 64 KB chunks
+                f.write(chunk)
+        logging.info(f"Saved: {file_path.name}")
+        return (url, file_path, None)
+    except Exception as e:
+        logging.error(f"Download failed for {url}: {e}")
+        return (url, file_path, e)
+
 def main():
     api_key = get_api_key()
     headers = {'x-api-key': api_key}
@@ -248,7 +275,11 @@ def main():
 
     # --- 2. Action Selection ---
     # Create the job folder immediately so we have a place to save the manifest
-    base_dir = Path(job_name)
+    save_path = input("\nEnter the folder path where files should be saved (press Enter for current directory): ").strip()
+    if save_path:
+        base_dir = Path(save_path) / job_name
+    else:
+        base_dir = Path(job_name)
     base_dir.mkdir(exist_ok=True)
 
     print(f"\nFound {len(all_objects_map)} records containing digital objects.")
@@ -296,48 +327,79 @@ def main():
     # --- 3. Download / Resume Logic ---
     print("\nPDF SETTINGS:")
     make_pdf = input("Combine images into a single PDF for each record? (y/n): ").lower() == 'y'
-    
+
+    workers_input = input(f"Worker count for parallel downloads (press Enter for {DEFAULT_WORKERS}): ").strip()
+    workers = DEFAULT_WORKERS
+    if workers_input:
+        try:
+            workers = max(1, int(workers_input))
+        except ValueError:
+            logging.warning(f"Invalid worker count. Using default of {DEFAULT_WORKERS}.")
+
     resume_file = base_dir / "processed_naids.txt"
     processed_naids = set()
     if resume_file.exists():
         processed_naids = set(resume_file.read_text().splitlines())
 
-    failed_naids = []
-    session = requests.Session()
-    
-    logging.info(f"Starting downloads into folder: {base_dir.absolute()}")
-    logging.info(f"Already processed: {len(processed_naids)}, Remaining: {len(all_objects_map) - len(processed_naids)}")
-
+    # Collect all download tasks for unprocessed NAIDs and auto-save a manifest
+    manifest_rows = []  # (naid, url, title)
+    naid_dirs = {}
     for naid, info in all_objects_map.items():
         if naid in processed_naids:
             continue
-
-        # support both legacy list values and new dict values
         urls = info.get('urls') if isinstance(info, dict) else info
-
+        title = info.get('title', '') if isinstance(info, dict) else ''
         naid_dir = base_dir / naid
         naid_dir.mkdir(parents=True, exist_ok=True)
-        logging.info(f"Processing NAID {naid} with {len(urls)} URLs")
-
+        naid_dirs[naid] = naid_dir
         for url in urls:
-            file_path = naid_dir / url.rsplit('/', 1)[-1]
-            if not file_path.exists():
-                try:
-                    logging.info(f"Downloading: {url}")
-                    r = session.get(url, stream=True, timeout=30)
-                    r.raise_for_status()
-                    with open(file_path, 'wb') as f:
-                        for chunk in r.iter_content(8192): f.write(chunk)
-                    logging.info(f"Saved: {file_path.name}")
-                except Exception as e:
-                    logging.error(f"Download failed for {url}: {e}")
+            manifest_rows.append((naid, url, title))
 
+    manifest_path = base_dir / f"Manifest_{job_name}.csv"
+    with open(manifest_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['NAID', 'URL', 'Title'])
+        writer.writerows(manifest_rows)
+    logging.info(f"Manifest saved: {manifest_path.name} ({len(manifest_rows)} files)")
+
+    # Build download tasks from the saved manifest
+    download_tasks = [
+        (naid, url, naid_dirs[naid] / url.rsplit('/', 1)[-1])
+        for naid, url, _ in manifest_rows
+    ]
+
+    failed_naids = []
+
+    logging.info(f"Starting downloads into folder: {base_dir.absolute()}")
+    logging.info(f"Already processed: {len(processed_naids)}, Remaining: {len(naid_dirs)}")
+    logging.info(f"Total files to download: {len(download_tasks)} | Workers: {workers}")
+
+    # Run parallel downloads
+    naid_download_errors = set()
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {
+            executor.submit(download_file, url, file_path): (naid, url)
+            for naid, url, file_path in download_tasks
+        }
+        for future in as_completed(future_map):
+            naid, url = future_map[future]
+            try:
+                _, _, error = future.result()
+                if error:
+                    naid_download_errors.add(naid)
+            except Exception as e:
+                logging.error(f"Unexpected error for {url}: {e}")
+                naid_download_errors.add(naid)
+
+    # PDF logic and completion tracking (sequential, per NAID)
+    for naid, naid_dir in naid_dirs.items():
         success = True
         if make_pdf:
             success = run_pdf_logic(naid, naid_dir)
-        
-        if success:
-            with open(resume_file, "a") as f: f.write(f"{naid}\n")
+
+        if success and naid not in naid_download_errors:
+            with open(resume_file, "a") as f:
+                f.write(f"{naid}\n")
             processed_naids.add(naid)
         else:
             failed_naids.append(naid)
